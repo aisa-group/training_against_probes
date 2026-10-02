@@ -1,0 +1,122 @@
+# Mistral 7B with a continuously updated, nonlinear K=16 polytope at layer 19.
+model:
+  model_name: mistralai/Mistral-7B-Instruct-v0.1
+  tokenizer_name: mistralai/Mistral-7B-Instruct-v0.1
+
+lora:
+  r: 64
+  lora_alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj]
+  layers: null
+
+probe:
+  detector_type: polytope-probe
+  normalize_input: unit_norm
+  num_facets: 16
+  feature_dim: 4096
+  use_nonlinear: true
+  polytope_max_temperature: 0.0
+  train_sequence_aggregator: mean
+  eval_sequence_aggregator: mean
+
+probe_training:
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  num_epochs: 1
+  max_steps: 3000
+  batch_size: 32
+  grad_accum_steps: 1
+  clip_grad_norm: 1.0
+  device: cuda
+  scheduler: cosine
+  warmup_steps: 50
+  loss_type: polytope
+  polytope:
+    margin: 1.0
+    unsafe_weight: 2.0
+    f_l1_weight: 1.0e-3
+    phi_l1_weight: 1.0e-4
+    entropy_mode: sap_reassign
+    entropy_weight: 1.0
+    entropy_temp: 1.0
+    valid_edges_threshold: 0.0
+    max_attempts: 100
+    assignment_level: token
+    retrain_scope: constraints_only
+    freeze_input_scale: true
+
+experiment:
+  layers: [19]
+  obfuscate_over: generation
+  max_sequence_length: 4092
+  model_batch_size: 8
+  cache_activations_save_path: null
+  n_train: 750
+  n_eval: 500
+
+datasets:
+  probe_source: beavertails
+  train:
+    - [wildguardtest_harmful, wildguardtest_unharmful]
+  eval:
+    - [xstest_unsafe, xstest_safe]
+
+finetune:
+  n_steps: 50
+  use_inmemory_for_onpolicy: true
+  inline_downstream: true
+  utility_threshold_pct: 0.8
+  score_onpolicy_strongreject: true
+  polytope_step_diagnostics: true
+  batch_size: 8
+  batch_size_kl: 16
+  kl_micro_batch: 8
+  kl_max_seq_len_roll: 512
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  kl_penalty: 16
+  kl_rollouts: ${oc.env:NM_ROOT,/data/new_master}/datasets/dolci_kl_groundtruth.json
+  kl_max_pool: 1000
+  kl_chunk_size: 64
+  kl_max_seq_len: 256
+  rl_max_seq_len: 512
+  max_new_tokens: 256
+  max_seq_len: 1024
+
+  probe_loss_layers: [19]
+  polytope_layers: [19]
+  probe_loss_type: polytope
+  polytope_lora_loss: sum_relu
+  polytope_lora_margin: 1.0
+
+  probe_retrain_interval: 1
+  probe_retrain_mode: retrain
+  probe_retrain_steps: 500
+
+  eval_interval: 1
+  save_dir: ${oc.env:NM_ROOT,/data/new_master}/finetune
+
+  vllm_gpu_memory_utilization: 0.85
+  swap_model_for_vllm: true
+
+  harmful_train_split: circuit_breakers_train
+  benign_train_split: benign_instructions_train
+
+  ifeval_loss:
+    enabled: false
+
+eval:
+  enabled: false
+
+utility_eval:
+  enabled: true
+  use_inmemory_model: false
+  mmlu_n_samples: 100
+  mmlu_per_subject: 5
+  max_new_tokens_mmlu: 8
+  gsm8k_n_samples: 100
+  max_new_tokens_gsm8k: 512
+  ifeval_n_samples: 100
+  max_new_tokens_ifeval: 512
+  gpu_memory_utilization: 0.5

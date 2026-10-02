@@ -1,0 +1,154 @@
+model:
+  model_name: mlabonne/Qwen3-8B-abliterated
+  tokenizer_name: mlabonne/Qwen3-8B-abliterated
+
+# LoRA adapter configuration
+lora:
+  r: 64
+  lora_alpha: 128
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - up_proj
+    - down_proj
+  layers: null  # null = all model layers; or list of ints e.g. [16, 20, 24]
+
+# Finetuning loop configuration
+finetune:
+  n_steps: 30                     # total model-update steps
+  batch_size: 8                   # prompts per class (harmful + benign) per step
+  batch_size_kl: 16               # KL-divergence samples per step
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  kl_penalty: 2                 # weight on KL loss: L = probe_loss + kl_penalty * kl_loss
+  kl_dataset: HuggingFaceH4/ultrachat_200k
+  kl_max_pool: 1000               # how many UltraChat prompts to preload
+  kl_chunk_size: 64               # sequence positions per chunk for KL computation
+  kl_max_seq_len: 256             # max tokenized length for KL batches (shorter = less memory)
+  rl_max_seq_len: 512             # max tokenized length for REINFORCE log-prob pass (lm_head memory)
+  max_new_tokens: 256             # max generation length for on-policy completions
+  max_seq_len: 1024               # max tokenized length for probe/KL batches
+
+  # Probe loss layers: null = all probe layers; or e.g. [12, 16, 20, 28]
+  probe_loss_layers: [0, 6, 12, 18, 24, 30, 35]  # Qwen3-8B has 36 layers
+
+  # Probe retraining schedule
+  probe_retrain_interval: 1       # retrain probes every N model-update steps
+  probe_retrain_mode: retrain     # retrain (warm-start current probes) or reinit (train from scratch using probe_config.yaml settings)
+  probe_retrain_steps: 0          # optimizer steps per phase (retrain mode only; ignored for reinit)
+
+  # Probe-supervision loss kind:
+  #   'bce'   — sigmoid-BCE; unbounded "keep-pushing" gradient on the wrong
+  #             side of the boundary, saturates only via sigmoid.
+  #   'hinge' — max(0, margin - y'·z) with y' = 2y-1; gradient is exactly 0
+  #             once z is `margin` past the boundary on the right side.
+  #             Test of §5.4 hypothesis ("probe-fooling vs. honest safety").
+  #   'polytope' - push every completion INSIDE the learned safety polytope
+  #             with margin, over all K facets. Requires
+  #             probe.detector_type == polytope-probe.
+  probe_loss_type: bce
+  probe_hinge_margin: 1.0          # used only when probe_loss_type == 'hinge'
+
+  # Polytope LoRA loss (used only when probe_loss_type == 'polytope').
+  #   sum_relu - mean_k relu(margin + v_k); dense gradient on every facet. Default.
+  #   max_relu - relu(margin + max_k v_k); worst facet only. Ablation.
+  #   lse      - relu(margin + T*logsumexp(v/T)); smooth interpolation. Ablation.
+  polytope_lora_loss: sum_relu
+  polytope_lora_margin: 1.0
+  polytope_lse_temp: 1.0
+  # Layers the polytope loss is applied at. null -> fall back to
+  # probe_loss_layers. Kept separate because the concept encoder retains a
+  # (batch, seq, feature_dim) tensor per layer for the backward, so a 6-layer
+  # polytope costs 8-14 GB of activations. [19] here == SaP's layer 20
+  # (this repo indexes hidden_states[layer_idx + 1]).
+  polytope_layers: null
+  # Per-step polytope diagnostics (geometry, membership, AUROC) to W&B and to
+  # <lora_root>/<run>/step_<n>/polytope_diag.json. Cheap: one forward pass over
+  # 64 fixed sequences.
+  polytope_step_diagnostics: true
+
+  # Evaluation schedule (run eval after every eval_interval model-update steps)
+  eval_interval: 1                # also run at final step
+
+  # Checkpoint directory
+  save_dir: /data/new_master/finetune
+
+  # vLLM settings for on-policy generation
+  # Generate on-policy completions with the live in-memory PEFT model instead of
+  # spawning a vLLM subprocess per step.
+  #
+  # The vLLM path spawns a subprocess purely to force GPU memory release (vLLM
+  # preallocates ~85% of VRAM for its KV cache and does not free it reliably),
+  # and pays a full checkpoint reload from lustre every step -- measured at ~9
+  # min for Mistral-7B, ~60% of a frozen-regime step, ~324 GPU-hours across a
+  # 72-run grid. In-memory generation skips that entirely: the weights are
+  # already resident with the current adapter applied.
+  #
+  # HF generate is slower per token than vLLM, but at 16 prompts x 256 tokens
+  # that loses far less than the reload costs. Set false to fall back.
+  use_inmemory_for_onpolicy: true
+
+  vllm_gpu_memory_utilization: 0.85
+  swap_model_for_vllm: true       # move HF model to CPU during vLLM generation
+
+  # Training prompt pools (splits from ${oc.env:PROBE_COMPLETIONS_DATASET})
+  harmful_train_split: circuit_breakers_train
+  benign_train_split: benign_instructions_train
+
+  # IFEval instruction-following loss term
+  # Samples are disjoint from the utility_eval IFEval pool (those are excluded here).
+  # CE loss is computed on on-policy completions that pass all IFEval instructions.
+  # When enabled, "_ifeval" is appended to the run name.
+  ifeval_loss:
+    enabled: false
+    n_samples: 16          # IFEval prompts sampled per training step
+    penalty: 0.1         # coefficient: L += penalty * ifeval_ce_loss
+    max_seq_len: 512       # max tokenized length for CE computation (mini-batched)
+
+# Evaluation configuration
+eval:
+  enabled: false
+  n_on_policy: 100          # on-policy completions per split
+  harmful_splits:           # splits used for jailbreak-rate eval
+    - advbench
+    - harmful_instructions
+  benign_splits:
+    - benign_instructions
+  # Probe test pairs for AUC-ROC eval (harmful_split vs benign_split)
+  probe_test_pairs:
+    - [advbench, benign_instructions]
+    - [harmful_instructions, benign_instructions]
+
+# Utility evaluation — measures whether finetuning hurts general capability.
+# All evals are sample-limited to keep total wall-clock time manageable.
+# Run at every eval checkpoint alongside the jailbreak / probe eval.
+utility_eval:
+  enabled: true
+
+  # Use the live in-memory PEFT model for utility-eval generation instead of
+  # spawning a vLLM subprocess that re-reads the checkpoint from disk.
+  # Required for Qwen3 (vLLM has no native impl, falls back to HF anyway).
+  use_inmemory_model: true
+
+  # MMLU (cais/mmlu "all", test split): multiple-choice knowledge & reasoning
+  # across 57 subjects.  Only the first letter A/B/C/D is needed, so
+  # max_new_tokens can be very small.
+  mmlu_n_samples: 500
+  max_new_tokens_mmlu: 8
+
+  # GSM8K (openai/gsm8k "main", test split): grade-school math word problems.
+  # Zero-shot chain-of-thought; answer extracted from "#### <number>" marker.
+  gsm8k_n_samples: 500
+  max_new_tokens_gsm8k: 512
+
+  # IFEval (google/IFEval, train split): rule-based instruction-following with
+  # verifiable criteria (word counts, formatting constraints, forbidden words,
+  # JSON format, etc.).  No LLM judge — all checks are deterministic.
+  ifeval_n_samples: 500
+  max_new_tokens_ifeval: 512
+
+  # vLLM GPU memory fraction shared by all utility generation passes.
+  gpu_memory_utilization: 0.5

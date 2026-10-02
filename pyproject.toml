@@ -1,0 +1,39 @@
+[project]
+name = "alignment-via-probes"
+version = "0.1.0"
+description = "Alignment via training against probes without losing monitorability"
+requires-python = "==3.12.*"
+# Pinned to the software stack the Qwen3-14B honesty runs were trained with
+# (vLLM 0.8.5.post1 is the oldest vLLM that supports Qwen3; it fixes torch 2.6.0).
+dependencies = [
+    "torch==2.6.0",
+    "vllm==0.8.5.post1",
+    "transformers==4.51.3",
+    "peft==0.20.0",
+    "accelerate==1.6.0",
+    "datasets==3.6.0",
+    "trl==0.18.2",              # only src/dpo_finetune.py (DPO baseline)
+    "tensordict==0.14.2",
+    "lm-eval[ifeval]==0.4.11",  # utility evaluation (MMLU, GSM8K, IFEval)
+    "judgezoo==0.1.9",          # StrongREJECT judge
+    "wandb",
+    "omegaconf",
+    "numpy<2.3",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "openai",                   # GPT-based judges / completion classifier
+    "python-dotenv",
+    "filelock",
+    "pyyaml",
+    "tqdm",
+    "safetensors",
+]
+
+[tool.uv]
+package = false
+# judgezoo 0.1.9 declares transformers>=4.57, but its StrongREJECT judge runs on
+# the transformers version vLLM 0.8.5 requires; keep the whole stack consistent.
+override-dependencies = ["transformers==4.51.3"]

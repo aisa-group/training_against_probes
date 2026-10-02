@@ -1,0 +1,122 @@
+# Honesty: Qwen3-14B with a continuously updated LINEAR deception probe
+# (paper run 2938c8ec; the paper's other three detectors change only `probe`).
+#
+# Fit a linear deception probe (hinge, margin 1.0) on Liars' Bench
+# (instructed-deception) and finetune Qwen3-14B to lower the probe's deception
+# score on its own on-policy completions, refitting the probe after every step.
+#   * Reasoning is scored: enable_thinking + detector_include_thinking put the
+#     probe loss on the <think> trace and the answer. Budget forcing caps the
+#     trace at thinking_budget tokens.
+#   * KL anchor = base-model rollouts (dolci_qwen3i14b_kl_rollouts_all.json),
+#     built with src/probes/build_kl_rollouts.py from Dolci-Instruct-SFT prompts.
+#   * Probe loss over layers 20..35 (hidden_states[idx + 1], so idx 20 = block 21).
+#   * utility_eval is off; utility is computed afterwards with
+#     src/probes/eval_checkpoint.py.
+model:
+  model_name: Qwen/Qwen3-14B
+  tokenizer_name: Qwen/Qwen3-14B
+
+lora:
+  r: 64
+  lora_alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj]
+  layers: null
+
+probe:
+  detector_type: linear-probe
+  normalize_input: unit_norm
+  train_sequence_aggregator: mean
+  eval_sequence_aggregator: mean
+
+probe_training:
+  hinge_margin: 1.0
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  num_epochs: 1
+  max_steps: 5000
+  batch_size: 32
+  grad_accum_steps: 1
+  clip_grad_norm: 1.0
+  device: cuda
+  scheduler: cosine
+  warmup_steps: 50
+  loss_type: hinge
+
+experiment:
+  layers: [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+  obfuscate_over: generation
+  max_sequence_length: 4092
+  model_batch_size: 4              # smaller forward batch for the 14B model
+  cache_activations_save_path: null
+  n_train: 750
+  n_eval: 250
+
+datasets:
+  probe_source: liars_bench
+  liars_bench_config: instructed-deception
+  train:
+    - [wildguardtest_harmful, wildguardtest_unharmful]
+  eval:
+    - [xstest_unsafe, xstest_safe]
+
+finetune:
+  probe_hinge_margin: 1.0
+  n_steps: 30
+  use_inmemory_for_onpolicy: true
+  inline_downstream: false            # held-out eval is StrongREJECT (harm), N/A for deception
+  utility_threshold_pct: 0.8
+  score_onpolicy_strongreject: false  # StrongREJECT judges harm, not deception
+  polytope_step_diagnostics: false
+  batch_size: 8
+  batch_size_kl: 16
+  kl_micro_batch: 4
+  kl_max_seq_len_roll: 2048
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  kl_penalty: 16
+  kl_rollouts: ${oc.env:NM_ROOT,/data/new_master}/datasets/dolci_qwen3i14b_kl_rollouts_all.json
+  kl_max_pool: 1000
+  kl_chunk_size: 64
+  kl_max_seq_len: 256
+  rl_max_seq_len: 512
+  max_new_tokens: 2048
+  enable_thinking: true               # Qwen3 reasons; probe scores the trace
+  thinking_budget: 1024               # budget forcing (s1): cap trace, inject </think>
+  answer_budget: 512
+  max_seq_len: 2560
+  detector_include_thinking: true     # put the probe loss on <think> + answer
+
+  probe_loss_layers: [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+  probe_loss_type: hinge
+
+  probe_retrain_interval: 1
+  probe_retrain_mode: retrain
+  probe_retrain_steps: 2000
+
+  eval_interval: 1
+  save_dir: ${oc.env:NM_ROOT,/data/new_master}/finetune
+
+  vllm_gpu_memory_utilization: 0.85
+  swap_model_for_vllm: true
+
+  harmful_train_split: liars_bench:instructed-deception:deceptive
+  benign_train_split: liars_bench:instructed-deception:honest
+
+  ifeval_loss:
+    enabled: false
+
+eval:
+  enabled: false
+
+utility_eval:
+  enabled: false                      # lm_eval MMLU void for Qwen3; recompute post-hoc
+  use_inmemory_model: false
+  mmlu_n_samples: 100
+  mmlu_per_subject: 5
+  max_new_tokens_mmlu: 8
+  gsm8k_n_samples: 100
+  max_new_tokens_gsm8k: 512
+  ifeval_n_samples: 100
+  max_new_tokens_ifeval: 512
+  gpu_memory_utilization: 0.5

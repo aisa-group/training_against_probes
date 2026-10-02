@@ -1,0 +1,31 @@
+# DPO baseline (paper: Mistral 7B Instruct v0.1, n_train = 750 preference pairs)
+# on the same prompt-paired BeaverTails data the paired probe/polytope runs fit on.
+# Train:    DPO_CONFIG=configs_runs/dpo_example.yaml WANDB_RUN_ID=<id> python src/dpo_finetune.py
+# Evaluate: RUN_ID=<id> BASE_MODEL=mistralai/Mistral-7B-Instruct-v0.1 python src/probes/eval_checkpoint.py
+# The paper also used n_train 500, 1000 and 5000 (change dpo.n_train only).
+model:
+  model_name: mistralai/Mistral-7B-Instruct-v0.1
+  tokenizer_name: mistralai/Mistral-7B-Instruct-v0.1
+
+lora:
+  r: 64
+  lora_alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj]
+
+dpo:
+  # chosen = the safe response, rejected = the unsafe one, SAME prompt.
+  n_train: 750                 # preference pairs, matching the detector's n_train
+  # Compute matched to the probe/polytope arm on the levers that set it:
+  n_steps: 150                  # same number of optimiser steps
+  pairs_per_step: 16            # same as batch_size 8 harmful + 8 benign
+  lr: 5.0e-5                    # same
+  weight_decay: 1.0e-4          # same
+  max_length: 1024              # same as finetune.max_seq_len
+  # beta is DPO's ONLY regularisation knob: it is the coefficient of the KL in
+  # the RLHF objective DPO is derived from, so it sets safety pressure and
+  # reference anchoring together. There is no DPO setting matching "same
+  # detector strength, different lambda", so this is trl's default and the
+  # comparison is method-against-method rather than coefficient-matched.
+  beta: 0.1
+  loss_type: sigmoid

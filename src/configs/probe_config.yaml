@@ -1,0 +1,88 @@
+# Training hyperparameters
+probe_training:
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  num_epochs: 1
+  max_steps: 5000          # if set, overrides num_epochs
+  batch_size: 32
+  grad_accum_steps: 1
+  clip_grad_norm: 1.0
+  device: cuda
+  scheduler: cosine        # linear | cosine | constant
+  warmup_steps: 50
+
+  # Probe-FITTING loss. Distinct from finetune.probe_loss_type, which is the
+  # LoRA-side loss.
+  #   'bce'      - sigmoid-BCE on the pooled logit (default, all published runs)
+  #   'hinge'    - max(0, margin - y'*z), saturates at the margin
+  #   'polytope' - Safety Polytope (arXiv:2505.24445); bypasses the aggregator
+  #                and fits K facets on the raw per-token violations
+  loss_type: bce
+  hinge_margin: 1.0
+
+  # Read only when loss_type == 'polytope'. See probe_archs.polytope_fit_loss.
+  polytope:
+    margin: 1.0                  # SaP uses 20-60 on RAW activations; we feed unit-norm inputs
+    unsafe_weight: 2.0           # SaP default
+    f_l1_weight: 1.0e-3          # SaP 1.0 at their activation scale; rescaled for unit_norm
+    phi_l1_weight: 1.0e-4        # SaP default
+    entropy_mode: sap_reassign   # sap_reassign | soft | none
+    entropy_weight: 1.0          # only affects the gradient when entropy_mode == 'soft'
+    entropy_temp: 1.0
+    valid_edges_threshold: 0.0   # tau in SaP Appendix A
+    max_attempts: 100
+    assignment_level: token          # as SaP. Their dataset rows ARE tokens, so this is their setting.
+    retrain_scope: constraints_only  # constraints_only (freeze encoder) | all
+    freeze_input_scale: true     # keep the step-0 unit_norm scale across warm-started retrains
+
+# Probe architecture
+probe:
+  detector_type: linear-probe   # linear-probe | nonlinear-probe | attention-probe | transformer-probe | gdm-probe | mean-difference-probe
+  normalize_input: unit_norm    # none | l2 | unit_norm
+  # nonlinear-probe
+  d_mlp: 128
+  # attention-probe / gdm-probe
+  d_proj: 100
+  nhead: 1
+  sliding_window: null
+  use_checkpoint: true
+  # transformer-probe
+  nlayer: 1
+  dropout: 0.0
+  activation: relu
+  norm_first: true
+  # polytope-probe (Safety Polytope, arXiv:2505.24445)
+  num_facets: 16                # K half-spaces
+  feature_dim: 4096             # concept-encoder width; SaP uses 16384 (unablated)
+  use_nonlinear: true           # false -> identity encoder = K-headed linear probe, zero memory overhead
+  polytope_max_temperature: 0.0 # 0 -> hard max over facets in forward(); >0 -> log-sum-exp smooth max
+  # sequence aggregation
+  train_sequence_aggregator: mean   # mean | max | last | sum | multimax | attention | rolling_attention | null (token-level)
+  eval_sequence_aggregator: mean
+
+# Experiment settings
+experiment:
+  layers: null                    # null = all layers; or e.g. [12, 16, 20]
+  obfuscate_over: generation      # generation | full-prompt | last-token-prompt | full | last-token-generation
+  max_completion_length: null
+  max_sequence_length: 4092 # 1048 for fortress
+  model_batch_size: 8
+  cache_activations_save_path: null
+  n_train: 250                    # max samples per class for training
+  n_eval: 100                     # max samples per class per eval pair
+
+# Datasets
+datasets:
+  # Which data the probe/polytope is FITTED on. Used identically at step 0 and at
+  # every refit, so the regimes stay interpretable. Refitting is off-policy: this
+  # text is fixed for the whole run, only the activations are recomputed.
+  #   wildguard    the train pairs below (default; the 1-D runs used this)
+  #   beavertails  PKU-Alignment/BeaverTails, 14 harm categories (SaP's interp data)
+  #   harmbench    the model's own generations under attack (SaP's stronger setting);
+  #                requires a prepared parquet file at harmbench_path
+  probe_source: wildguard
+  harmbench_path: /data/new_master/datasets/harmbench_mistral.parquet
+  train:
+    - [wildguardtest_harmful, wildguardtest_unharmful]
+  eval:
+    - [xstest_unsafe, xstest_safe]

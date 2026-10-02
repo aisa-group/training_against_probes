@@ -1,0 +1,114 @@
+Claudini (https://github.com/romovpa/claudini) patch for running attacks on LoRA
+checkpoint dirs passed as --model. Base commit f97da47ca1f4cfcadb26ce54fd98ed4d960bd157
+(also applies to ef4c9554359da36a504a028477608fce6bad449d). Apply from the claudini root:
+    git apply claudini_lora.patch
+
+--- a/claudini/model_loader.py
++++ b/claudini/model_loader.py
+@@ -1,6 +1,8 @@
+ """Model loading with PEFT adapter merging and quantization support."""
+ 
+ import logging
++import os
++import time
+ from pathlib import Path
+ 
+ import torch
+@@ -26,23 +28,75 @@
+     except Exception:
+         return None
+ 
+-    merged_dir = Path(HF_HUB_CACHE) / (model_name.split("/")[-1] + "-merged")
++    # Build a cache key from the last two path components so adapters whose
++    # leaf names collide (e.g. multiple runs with `step_12` or `final_lora`)
++    # don't share a merged cache dir. For HF repo ids this resolves to
++    # `<org>__<repo>-merged`; for local paths it's `<run_id>__<leaf>-merged`.
++    parts = [p for p in model_name.replace("\\", "/").rstrip("/").split("/") if p]
++    cache_key = "__".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
++    merged_dir = Path(HF_HUB_CACHE) / f"{cache_key}-merged"
+     if merged_dir.exists():
+         logger.info("Using cached merged model: %s", merged_dir)
+         return merged_dir
+ 
+     base_id = peft_config.base_model_name_or_path
+-    logger.info("Merging PEFT adapter %s (base: %s) ...", model_name, base_id)
+ 
+-    model = AutoModelForCausalLM.from_pretrained(base_id, dtype=torch.bfloat16, device_map="cpu")
++    # Multi-process safe: write merge into a per-PID staging dir, atomic-rename
++    # to the canonical merged_dir when fully written. Concurrent jobs that
++    # arrive after the rename hit the cache hit branch above; ones that arrive
++    # before do their own merge into a separate staging dir (last write wins,
++    # contents are equivalent). Jobs in flight whose rename hasn't happened yet
++    # poll for the canonical dir to appear so they don't waste GPU time on a
++    # duplicate merge.
++    canonical = merged_dir
++    poll_deadline = time.time() + 15 * 60  # cap: 15 min wait
++    while time.time() < poll_deadline:
++        if canonical.exists() and (canonical / "config.json").exists() and any(canonical.glob("*.safetensors*")):
++            logger.info("Merged model became available during wait: %s", canonical)
++            return canonical
++        # If no other process is staging it, break and do the merge ourselves.
++        if not list(canonical.parent.glob(f"{canonical.name}.staging.*")):
++            break
++        time.sleep(15)
++
++    staging = canonical.parent / f"{canonical.name}.staging.{os.getpid()}"
++    if staging.exists():
++        # Stale staging from a previous crashed run: clean it.
++        import shutil
++        shutil.rmtree(staging, ignore_errors=True)
++
++    logger.info("Merging PEFT adapter %s (base: %s) -> %s ...", model_name, base_id, staging)
++
++    # Merge on GPU when available: a CPU merge of a 7B-class model takes 10 to 15
++    # min and is dominated by sequential matmuls. With 1 GPU it's ~30 s.
++    merge_device = "cuda" if torch.cuda.is_available() else "cpu"
++    model = AutoModelForCausalLM.from_pretrained(base_id, dtype=torch.bfloat16, device_map=merge_device)
+     model = PeftModel.from_pretrained(model, model_name)
+     model = model.merge_and_unload()
+ 
+-    merged_dir.mkdir(parents=True, exist_ok=True)
+-    model.save_pretrained(merged_dir)
+-    AutoTokenizer.from_pretrained(model_name).save_pretrained(merged_dir)
+-    logger.info("Merged model saved to %s", merged_dir)
+-    return merged_dir
++    staging.mkdir(parents=True, exist_ok=True)
++    model.save_pretrained(staging)
++    # Adapter dirs often lack tokenizer files; fall back to the base model's
++    # tokenizer when loading from the adapter path fails.
++    try:
++        tokenizer = AutoTokenizer.from_pretrained(model_name)
++    except Exception:
++        logger.info("Adapter %s has no tokenizer; using base %s tokenizer", model_name, base_id)
++        tokenizer = AutoTokenizer.from_pretrained(base_id)
++    tokenizer.save_pretrained(staging)
++
++    # Atomic publish: rename staging -> canonical. If a peer beat us, they win.
++    try:
++        staging.rename(canonical)
++        logger.info("Merged model saved to %s", canonical)
++    except OSError:
++        if canonical.exists():
++            logger.info("Peer published merged model first: %s (cleaning local stage)", canonical)
++            import shutil
++            shutil.rmtree(staging, ignore_errors=True)
++        else:
++            raise
++    return canonical
+ 
+ 
+ def make_bnb_config(quantization: str | None, dtype: torch.dtype):
+@@ -89,7 +143,12 @@
+     )
+ 
+     model.config._name_or_path = model_name
+-    tokenizer = AutoTokenizer.from_pretrained(model_name)
++    try:
++        tokenizer = AutoTokenizer.from_pretrained(model_name)
++    except Exception:
++        # Adapter dirs often lack tokenizer config; load from the merged checkpoint
++        # if we just produced one, otherwise from the resolved model_id.
++        tokenizer = AutoTokenizer.from_pretrained(model_id)
+     configure_pad_token(tokenizer)
+ 
+     short = model_name.split("/")[-1]
